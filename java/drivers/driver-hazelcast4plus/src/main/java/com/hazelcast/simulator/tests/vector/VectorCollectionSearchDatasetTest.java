@@ -3,6 +3,7 @@ package com.hazelcast.simulator.tests.vector;
 import com.hazelcast.config.vector.Metric;
 import com.hazelcast.config.vector.VectorCollectionConfig;
 import com.hazelcast.config.vector.VectorIndexConfig;
+import com.hazelcast.core.Pipelining;
 import com.hazelcast.simulator.hz.HazelcastTest;
 import com.hazelcast.simulator.test.BaseThreadState;
 import com.hazelcast.simulator.test.annotations.AfterRun;
@@ -16,10 +17,11 @@ import com.hazelcast.vector.VectorValues;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static java.lang.String.format;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 public class VectorCollectionSearchDatasetTest extends HazelcastTest {
 
@@ -42,6 +44,9 @@ public class VectorCollectionSearchDatasetTest extends HazelcastTest {
     // search parameters
 
     public int limit = 1;
+
+    // maximum concurrent putAllAsync operations in flight
+    public int maxPutAllInFlight = 10;
 
     // inner test parameters
 
@@ -76,41 +81,46 @@ public class VectorCollectionSearchDatasetTest extends HazelcastTest {
                         )
         );
 
-        var start = System.currentTimeMillis();
+        var start = System.nanoTime();
 
-        Map<Integer, VectorDocument<Integer>> buffer = new HashMap<>();
+        Map<Integer, VectorDocument<Integer>> buffer = new HashMap<>(PUT_BATCH_SIZE);
         int index;
         logger.info("Start loading data...");
+        Pipelining<Void> pipelining = new Pipelining<>(maxPutAllInFlight);
         while ((index = putCounter.getAndIncrement()) < size) {
             buffer.put(index, VectorDocument.of(index, VectorValues.of(reader.getTrainVector(index))));
             if (buffer.size() % PUT_BATCH_SIZE == 0) {
-                var blockStart = System.currentTimeMillis();
-                collection.putAllAsync(buffer).toCompletableFuture().join();
-                logger.info(
-                        format(
-                                "Uploaded %s vectors from %s. Block size: %s. Delta (m): %s.  Total time (m): %s",
-                                index,
-                                size,
-                                buffer.size(),
-                                TimeUnit.MILLISECONDS.toMinutes(System.currentTimeMillis() - blockStart),
-                                TimeUnit.MILLISECONDS.toMinutes(System.currentTimeMillis() - start)
-                        )
-                );
-                buffer.clear();
+                // send a putAll batch
+                logger.info("Sending a putAll batch");
+                addToPipelineWithLogging(pipelining, collection.putAllAsync(buffer));
+                // Clearing the buffer currently only works with a Hazelcast Client as test driver.
+                // When test executes on an embedded member, the map that is passed as argument
+                // to putAllAsync is used by the implementation. Until we fix this by making a defensive copy
+                // of the map, we should be creating a new buffer HashMap here instead of clear()
+                // buffer.clear();
+                buffer = new HashMap<>(PUT_BATCH_SIZE);
             }
         }
         if (!buffer.isEmpty()) {
-            collection.putAllAsync(buffer).toCompletableFuture().join();
+            addToPipelineWithLogging(pipelining, collection.putAllAsync(buffer));
             logger.info(format("Uploaded vectors. Last block size: %s.", buffer.size()));
             buffer.clear();
         }
-        var startCleanup = System.currentTimeMillis();
+        // block until all putAll batches are done
+        try {
+            pipelining.results();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        logger.info("Finished loading data after ", NANOSECONDS.toSeconds(System.nanoTime() - start));
+
+        var startCleanup = System.nanoTime();
         collection.optimizeAsync().toCompletableFuture().join();
 
         logger.info("Collection size: " + size);
         logger.info("Collection dimension: " + reader.getDimension());
-        logger.info("Cleanup time(ms): " + (System.currentTimeMillis() - startCleanup));
-        logger.info("Index build time(m): " + TimeUnit.MILLISECONDS.toMinutes(System.currentTimeMillis() - start));
+        logger.info("Cleanup time(ms): " + NANOSECONDS.toMillis (System.nanoTime() - startCleanup));
+        logger.info("Index build time(m): " + NANOSECONDS.toMinutes(System.nanoTime() - start));
     }
 
     @TimeStep(prob = 1)
@@ -139,5 +149,20 @@ public class VectorCollectionSearchDatasetTest extends HazelcastTest {
     }
 
     public static class ThreadState extends BaseThreadState {
+    }
+
+    void addToPipelineWithLogging(Pipelining<Void> pipelining, CompletionStage<Void> asyncInvocation) {
+        var now = System.nanoTime();
+        try {
+            pipelining.add(asyncInvocation);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+        var nanosBlocked = System.nanoTime() - now;
+        // log if we were blocked for more than 10ms
+        if (now > 10_000_000) {
+            logger.info(format("Thread was blocked for %d msec due to reaching max pipeline depth",
+                    NANOSECONDS.toMillis(nanosBlocked)));
+        }
     }
 }
